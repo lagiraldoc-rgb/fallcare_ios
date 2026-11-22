@@ -20,12 +20,12 @@ workflows:
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string bluetooth-central" ios/Runner/Info.plist
           flutter pub get
      - name: Build unsigned iOS IPA
-    script: |
-      set -e
-      flutter build ios --release --no-codesign
-      rm -rf Payload fallcare_app.ipa
-      mkdir -p Payload
-      cp -r build/ios/iphoneos/Runner.app Payload/
-      zip -r fallcare_app.ipa Payload
+        script: |
+          set -e
+          flutter build ios --release --no-codesign
+          rm -rf Payload fallcare_app.ipa
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r fallcare_app.ipa Payload
     artifacts:
       - fallcare_app.ipa
