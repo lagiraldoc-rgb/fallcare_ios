@@ -11,8 +11,9 @@ workflows:
       - name: Get Flutter packages
         script: |
           flutter pub get
-      - name: Configure iOS Background Bluetooth
+      - name: Generate iOS project with Background Bluetooth
         script: |
+          flutter create --platforms=ios .
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" ios/Runner/Info.plist 2>/dev/null || true
           grep -q "bluetooth-central" ios/Runner/Info.plist || /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string bluetooth-central" ios/Runner/Info.plist
           grep -q "NSBluetoothAlwaysUsageDescription" ios/Runner/Info.plist || /usr/libexec/PlistBuddy -c "Add :NSBluetoothAlwaysUsageDescription string 'FallCare necesita Bluetooth en segundo plano para detectar caidas.'" ios/Runner/Info.plist
