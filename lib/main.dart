@@ -66,7 +66,7 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   final _allergiesCtrl = TextEditingController();
   final _medsCtrl = TextEditingController();
 
-  List> _history = [];
+  List<dynamic> _history = [];
 
   @override
   void initState() {
