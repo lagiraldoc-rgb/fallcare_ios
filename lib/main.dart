@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -40,6 +42,7 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
 
   final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
+  final AudioPlayer _audioPlayer = AudioPlayer();
 
   BluetoothDevice? _connectedDevice;
   BluetoothCharacteristic? _fallChar;
@@ -47,7 +50,7 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   StreamSubscription<BluetoothConnectionState>? _connSub;
   StreamSubscription<Position>? _gpsSub;
 
-  Timer? _alarmTimer;
+  Timer? _hapticTimer;
   Timer? _countdownTimer;
 
   bool _isScanning = false;
@@ -59,12 +62,13 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   String _statusText = 'Presiona "Conectar SensorTile" para iniciar.';
   String _gpsText = 'GPS: Esperando ubicación...';
   String _mapsUrl = '';
+  String _autoAlertStatus = '';
 
   final _nameCtrl = TextEditingController();
+  final _contactNameCtrl = TextEditingController();
   final _phoneCtrl = TextEditingController();
   final _bloodCtrl = TextEditingController();
   final _allergiesCtrl = TextEditingController();
-  final _medsCtrl = TextEditingController();
 
   List<dynamic> _history = [];
 
@@ -72,8 +76,23 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   void initState() {
     super.initState();
     _initNotifications();
+    _initAudio();
     _loadSavedData();
     _startGpsTracking();
+  }
+
+  Future<void> _initAudio() async {
+    try {
+      await _audioPlayer.setAudioContext(
+        AudioContext(
+          iOS: AudioContextIOS(
+            category: AVAudioSessionCategory.playback,
+            options: const {AVAudioSessionOptions.mixWithOthers},
+          ),
+        ),
+      );
+      await _audioPlayer.setReleaseMode(ReleaseMode.loop);
+    } catch (_) {}
   }
 
   Future<void> _initNotifications() async {
@@ -97,6 +116,7 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
         presentAlert: true,
         presentBadge: true,
         presentSound: true,
+        sound: 'alarma_caida.wav',
         interruptionLevel: InterruptionLevel.timeSensitive,
       ),
     );
@@ -112,10 +132,10 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _nameCtrl.text = prefs.getString('fc_name') ?? '';
+      _contactNameCtrl.text = prefs.getString('fc_contact_name') ?? '';
       _phoneCtrl.text = prefs.getString('fc_phone') ?? '';
       _bloodCtrl.text = prefs.getString('fc_blood') ?? '';
       _allergiesCtrl.text = prefs.getString('fc_allergies') ?? '';
-      _medsCtrl.text = prefs.getString('fc_meds') ?? '';
       final rawHist = prefs.getString('fc_history');
       if (rawHist != null) {
         final decoded = jsonDecode(rawHist) as List;
@@ -124,20 +144,24 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
     });
   }
 
-  Future<void> _saveSettings() async {
+  Future<void> _saveSettings({bool showBanner = true}) async {
     final prefs = await SharedPreferences.getInstance();
     final cleanPhone = _phoneCtrl.text.replaceAll(RegExp(r'\D'), '');
-    _phoneCtrl.text = cleanPhone;
     await prefs.setString('fc_name', _nameCtrl.text.trim());
+    await prefs.setString('fc_contact_name', _contactNameCtrl.text.trim());
     await prefs.setString('fc_phone', cleanPhone);
     await prefs.setString('fc_blood', _bloodCtrl.text.trim());
     await prefs.setString('fc_allergies', _allergiesCtrl.text.trim());
-    await prefs.setString('fc_meds', _medsCtrl.text.trim());
 
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Configuración y ficha médica guardadas.')),
-    );
+    if (showBanner && mounted) {
+      _phoneCtrl.text = cleanPhone;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Contacto y ficha médica guardados permanentemente.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
   }
 
   Future<void> _startGpsTracking() async {
@@ -157,24 +181,37 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
       return;
     }
 
+    try {
+      final initialPos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      );
+      _updateGpsState(initialPos);
+    } catch (_) {}
+
     _gpsSub?.cancel();
     _gpsSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
         distanceFilter: 5,
       ),
-    ).listen((pos) {
-      final lat = pos.latitude.toStringAsFixed(6);
-      final lon = pos.longitude.toStringAsFixed(6);
-      setState(() {
-        _mapsUrl = 'https://maps.google.com/?q=$lat,$lon';
-        _gpsText = 'Ubicación actual: $lat, $lon';
-      });
+    ).listen(_updateGpsState);
+  }
+
+  void _updateGpsState(Position pos) {
+    final lat = pos.latitude.toStringAsFixed(6);
+    final lon = pos.longitude.toStringAsFixed(6);
+    if (!mounted) return;
+    setState(() {
+      _mapsUrl = 'https://maps.google.com/?q=$lat,$lon';
+      _gpsText = 'Ubicación actual: $lat, $lon';
     });
   }
 
   Future<void> _scanAndConnect() async {
     if (_isScanning) return;
+    await _saveSettings(showBanner: false);
     setState(() {
       _isScanning = true;
       _statusText = 'Buscando SensorTile (AM1V420)...';
@@ -186,8 +223,8 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
       scanSub = FlutterBluePlus.scanResults.listen((results) async {
         for (final r in results) {
           final name = r.device.platformName;
-          final hasService = r.advertisementData.serviceUuids
-              .any((u) => u.toString().toLowerCase() == serviceUuid.toString().toLowerCase());
+          final hasService = r.advertisementData.serviceUuids.any((u) =>
+              u.toString().toLowerCase() == serviceUuid.toString().toLowerCase());
           if (name.contains('AM1V') || hasService) {
             await FlutterBluePlus.stopScan();
             await scanSub.cancel();
@@ -246,7 +283,8 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
               _charSub = c.onValueReceived.listen((value) {
                 if (value.isEmpty) return;
                 final byteVal = value[0];
-                setState(() => _lastByteText = 'Sensor: 0x0${byteVal.toRadixString(16)}');
+                setState(() =>
+                    _lastByteText = 'Sensor: 0x0${byteVal.toRadixString(16)}');
                 if (byteVal == 1) {
                   _triggerFallAlert();
                 }
@@ -260,7 +298,8 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
         _isConnected = true;
         _isScanning = false;
         _lastByteText = 'Sensor: 0x00 (Listo)';
-        _statusText = 'Monitoreando en primer y segundo plano (${device.platformName})';
+        _statusText =
+            'Monitoreando en primer y segundo plano (${device.platformName})';
       });
     } catch (e) {
       setState(() {
@@ -282,6 +321,8 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
       _isFallActive = true;
       _fallTime = now;
       _countdown = 15;
+      _autoAlertStatus =
+          'La alerta automática con ubicación se enviará al finalizar el conteo.';
     });
 
     _addHistory(dateStr, timeStr, 'Alerta activa (sin confirmar)');
@@ -294,34 +335,134 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
       if (_countdown <= 1) {
         timer.cancel();
         setState(() => _countdown = 0);
-        _updateLatestHistory('Alerta confirmada (sin respuesta tras 15s)');
+        _updateLatestHistory('Alerta confirmada (enviada automáticamente)');
+        _sendAutomaticAlert(timeStr);
       } else {
         setState(() => _countdown--);
       }
     });
   }
 
-  void _startAlarmSound() {
+  Future<void> _sendAutomaticAlert(String timeStr) async {
+    if (!mounted) return;
+    setState(() {
+      _autoAlertStatus = '📡 Enviando alerta automática con ubicación GPS...';
+    });
+
+    final digits = _phoneCtrl.text.replaceAll(RegExp(r'\D'), '');
+    final last10 =
+        digits.length >= 10 ? digits.substring(digits.length - 10) : digits;
+
+    if (last10.length < 7) {
+      if (mounted) {
+        setState(() {
+          _autoAlertStatus =
+              '⚠️ Configura un número de teléfono válido (10 dígitos).';
+        });
+      }
+      return;
+    }
+
+    if (_mapsUrl.isEmpty) {
+      try {
+        final pos = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: Duration(seconds: 4),
+          ),
+        );
+        _updateGpsState(pos);
+      } catch (_) {}
+    }
+
+    final patient = _nameCtrl.text.trim().isEmpty
+        ? 'Usuario FallCare'
+        : _nameCtrl.text.trim();
+    final blood =
+        _bloodCtrl.text.trim().isEmpty ? 'No registrado' : _bloodCtrl.text.trim();
+    final allergies = _allergiesCtrl.text.trim().isEmpty
+        ? 'Ninguna registrada'
+        : _allergiesCtrl.text.trim();
+    final locationLine =
+        _mapsUrl.isEmpty ? 'Ubicación GPS no disponible aún' : _mapsUrl;
+
+    final body = '''
+🚨 EMERGENCIA: Se ha detectado una caída de $patient ($timeStr).
+
+🩺 FICHA MÉDICA:
+• RH / EPS: $blood
+• Alergias: $allergies
+
+📍 UBICACIÓN ACTUAL:
+$locationLine
+''';
+
+    final uri = Uri.parse('https://ntfy.sh/fallcare-$last10');
+    final headers = <String, String>{
+      'Title': 'ALERTA DE CAIDA - $patient',
+      'Priority': 'urgent',
+      'Tags': 'rotating_light,warning',
+    };
+    if (_mapsUrl.isNotEmpty) {
+      headers['Actions'] = 'view, Ver ubicacion en mapa, $_mapsUrl';
+    }
+
+    try {
+      final response = await http.post(uri, headers: headers, body: body);
+      if (!mounted) return;
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final contactLabel = _contactNameCtrl.text.trim().isEmpty
+            ? _phoneCtrl.text.trim()
+            : '${_contactNameCtrl.text.trim()} (${_phoneCtrl.text.trim()})';
+        setState(() {
+          _autoAlertStatus =
+              '✅ Alerta y ubicación enviadas automáticamente a $contactLabel.';
+        });
+      } else {
+        setState(() {
+          _autoAlertStatus =
+              '⚠️ Error del servidor al enviar (${response.statusCode}).';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _autoAlertStatus = '⚠️ Sin conexión a internet para enviar la alerta.';
+        });
+      }
+    }
+  }
+
+  Future<void> _startAlarmSound() async {
     _stopAlarm();
-    SystemSound.play(SystemSoundType.alert);
     HapticFeedback.heavyImpact();
-    _alarmTimer = Timer.periodic(const Duration(milliseconds: 1100), (_) {
-      SystemSound.play(SystemSoundType.alert);
+    _hapticTimer = Timer.periodic(const Duration(milliseconds: 1100), (_) {
       HapticFeedback.heavyImpact();
     });
+
+    try {
+      await _audioPlayer.play(AssetSource('alarma_caida.wav'), volume: 1.0);
+    } catch (_) {
+      SystemSound.play(SystemSoundType.alert);
+      _hapticTimer?.cancel();
+      _hapticTimer = Timer.periodic(const Duration(milliseconds: 1100), (_) {
+        SystemSound.play(SystemSoundType.alert);
+        HapticFeedback.heavyImpact();
+      });
+    }
   }
 
   void _stopAlarm() {
-    _alarmTimer?.cancel();
-    _alarmTimer = null;
+    _hapticTimer?.cancel();
+    _hapticTimer = null;
+    _audioPlayer.stop();
   }
 
   Future<void> _acknowledgeFall() async {
     _stopAlarm();
     _countdownTimer?.cancel();
-    final elapsed = _fallTime != null
-        ? DateTime.now().difference(_fallTime!).inSeconds
-        : 0;
+    final elapsed =
+        _fallTime != null ? DateTime.now().difference(_fallTime!).inSeconds : 0;
     await _updateLatestHistory('Confirmada bien en ${elapsed}s');
 
     if (_fallChar != null) {
@@ -335,26 +476,18 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
 
     setState(() {
       _isFallActive = false;
+      _autoAlertStatus = '';
       _statusText = _isConnected
           ? 'Monitoreando en primer y segundo plano'
           : 'Presiona "Conectar SensorTile" para iniciar.';
     });
   }
 
-  Future<void> _openWhatsApp() async {
-    final phone = _phoneCtrl.text.trim();
-    if (phone.isEmpty) return;
-    final name = _nameCtrl.text.trim().isEmpty ? 'el usuario' : _nameCtrl.text.trim();
-    final msg =
-        '🚨 ALERTA DE CAÍDA (FallCare) 🚨\nPaciente: $name\n🩺 RH/EPS: ${_bloodCtrl.text} | Alergias: ${_allergiesCtrl.text}\n📍 Ubicación: $_mapsUrl';
-    final uri = Uri.parse('https://wa.me/$phone?text=${Uri.encodeComponent(msg)}');
-    await launchUrl(uri, mode: LaunchMode.externalApplication);
-  }
-
   Future<void> _callEmergency() async {
-    final phone = _phoneCtrl.text.trim();
+    final phone = _phoneCtrl.text.replaceAll(RegExp(r'\D'), '');
     if (phone.isEmpty) return;
-    await launchUrl(Uri.parse('tel:+$phone'));
+    final formatted = phone.length == 10 ? '+57$phone' : '+$phone';
+    await launchUrl(Uri.parse('tel:$formatted'));
   }
 
   Future<void> _addHistory(String date, String time, String status) async {
@@ -376,10 +509,16 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   @override
   void dispose() {
     _stopAlarm();
+    _audioPlayer.dispose();
     _countdownTimer?.cancel();
     _charSub?.cancel();
     _connSub?.cancel();
     _gpsSub?.cancel();
+    _nameCtrl.dispose();
+    _contactNameCtrl.dispose();
+    _phoneCtrl.dispose();
+    _bloodCtrl.dispose();
+    _allergiesCtrl.dispose();
     super.dispose();
   }
 
@@ -432,7 +571,8 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
                 _isFallActive
                     ? '¡CAÍDA DETECTADA!'
                     : (_isConnected ? 'TODO NORMAL' : 'SIN CONEXIÓN'),
-                style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w900),
+                style:
+                    const TextStyle(fontSize: 26, fontWeight: FontWeight.w900),
               ),
               const SizedBox(height: 6),
               Text(_statusText, textAlign: TextAlign.center),
@@ -448,12 +588,21 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
                   ),
                   child: Column(
                     children: [
-                      const Text('Tiempo para cancelar alerta:'),
+                      const Text('Tiempo para cancelar envío automático:'),
                       Text(
-                        _countdown > 0 ? '${_countdown}s' : '🚨 ALERTA ACTIVA',
+                        _countdown > 0 ? '${_countdown}s' : '🚨 ALERTA ENVIADA',
                         style: const TextStyle(
                             fontSize: 34, fontWeight: FontWeight.w900),
                       ),
+                      if (_autoAlertStatus.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          _autoAlertStatus,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                              fontSize: 13, fontWeight: FontWeight.w600),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -480,7 +629,6 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
                         Text('Paciente: ${_nameCtrl.text}'),
                         Text('RH / EPS: ${_bloodCtrl.text}'),
                         Text('Alergias: ${_allergiesCtrl.text}'),
-                        Text('Medicamentos: ${_medsCtrl.text}'),
                       ],
                     ),
                   ),
@@ -497,19 +645,6 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
                     onPressed: _acknowledgeFall,
                     child: const Text('CONFIRMAR QUE ESTOY BIEN',
                         style: TextStyle(fontWeight: FontWeight.bold)),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF25D366),
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                    ),
-                    onPressed: _openWhatsApp,
-                    child: const Text('📲 Enviar WhatsApp con ubicación'),
                   ),
                 ),
                 const SizedBox(height: 8),
@@ -564,36 +699,43 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    const Text('CONTACTO Y FICHA MÉDICA',
+                    const Text('CONTACTO DE EMERGENCIA Y FICHA MÉDICA',
                         style: TextStyle(fontWeight: FontWeight.bold)),
                     const SizedBox(height: 8),
                     TextField(
-                      controller: _nameCtrl,
-                      decoration: const InputDecoration(labelText: 'Nombre'),
+                      controller: _contactNameCtrl,
+                      onChanged: (_) => _saveSettings(showBanner: false),
+                      decoration: const InputDecoration(
+                          labelText: 'Nombre del contacto de emergencia'),
                     ),
                     TextField(
                       controller: _phoneCtrl,
                       keyboardType: TextInputType.phone,
+                      onChanged: (_) => _saveSettings(showBanner: false),
                       decoration: const InputDecoration(
-                          labelText: 'WhatsApp / Teléfono (ej. 573001234567)'),
+                          labelText: 'Teléfono de emergencia (ej. 313 580 7499)'),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _nameCtrl,
+                      onChanged: (_) => _saveSettings(showBanner: false),
+                      decoration: const InputDecoration(
+                          labelText: 'Nombre completo del paciente'),
                     ),
                     TextField(
                       controller: _bloodCtrl,
+                      onChanged: (_) => _saveSettings(showBanner: false),
                       decoration:
                           const InputDecoration(labelText: 'RH y EPS'),
                     ),
                     TextField(
                       controller: _allergiesCtrl,
+                      onChanged: (_) => _saveSettings(showBanner: false),
                       decoration: const InputDecoration(labelText: 'Alergias'),
                     ),
-                    TextField(
-                      controller: _medsCtrl,
-                      decoration:
-                          const InputDecoration(labelText: 'Medicamentos'),
-                    ),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: 12),
                     ElevatedButton(
-                      onPressed: _saveSettings,
+                      onPressed: () => _saveSettings(showBanner: true),
                       child: const Text('Guardar configuración'),
                     ),
                   ],
