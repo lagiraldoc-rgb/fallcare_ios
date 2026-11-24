@@ -11,6 +11,8 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+typedef FallEvent = Map<String, String>;
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const FallCareApp());
@@ -68,7 +70,7 @@ class _FallMonitorPageState extends State<FallMonitorPage>
   String _gpsText = 'GPS: Esperando ubicación...';
   String _mapsUrl = '';
   String _autoAlertStatus = '';
-  var _foundDevices = <ScanResult>[];
+  List<ScanResult> _foundDevices = [];
 
   final _nameCtrl = TextEditingController();
   final _contactNameCtrl = TextEditingController();
@@ -76,7 +78,7 @@ class _FallMonitorPageState extends State<FallMonitorPage>
   final _bloodCtrl = TextEditingController();
   final _allergiesCtrl = TextEditingController();
 
-  var _history = >[];
+  List<FallEvent> _history = [];
 
   @override
   void initState() {
@@ -164,7 +166,7 @@ class _FallMonitorPageState extends State<FallMonitorPage>
     String phone = '';
     String blood = '';
     String allergies = '';
-    var loadedHistory = >[];
+    List<FallEvent> loadedHistory = [];
 
     try {
       final file = _getBackupFile();
@@ -179,14 +181,15 @@ class _FallMonitorPageState extends State<FallMonitorPage>
           allergies = (data['fc_allergies'] ?? '').toString();
           final rawList = data['fc_history'];
           if (rawList is Iterable) {
-            loadedHistory = rawList
-                .whereType()
-                .map((e) => <String, String>{
-                      'date': (e['date'] ?? '').toString(),
-                      'time': (e['time'] ?? '').toString(),
-                      'status': (e['status'] ?? '').toString(),
-                    })
-                .toList();
+            for (final item in rawList) {
+              if (item is Map) {
+                loadedHistory.add({
+                  'date': (item['date'] ?? '').toString(),
+                  'time': (item['time'] ?? '').toString(),
+                  'status': (item['status'] ?? '').toString(),
+                });
+              }
+            }
           }
         }
       }
@@ -206,14 +209,15 @@ class _FallMonitorPageState extends State<FallMonitorPage>
       if (rawHist != null && loadedHistory.isEmpty) {
         final decoded = jsonDecode(rawHist);
         if (decoded is Iterable) {
-          loadedHistory = decoded
-              .whereType()
-              .map((e) => <String, String>{
-                    'date': (e['date'] ?? '').toString(),
-                    'time': (e['time'] ?? '').toString(),
-                    'status': (e['status'] ?? '').toString(),
-                  })
-              .toList();
+          for (final item in decoded) {
+            if (item is Map) {
+              loadedHistory.add({
+                'date': (item['date'] ?? '').toString(),
+                'time': (item['time'] ?? '').toString(),
+                'status': (item['status'] ?? '').toString(),
+              });
+            }
+          }
         }
       }
     } catch (_) {}
