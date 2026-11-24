@@ -68,7 +68,7 @@ class _FallMonitorPageState extends State<FallMonitorPage>
   String _gpsText = 'GPS: Esperando ubicación...';
   String _mapsUrl = '';
   String _autoAlertStatus = '';
-  List<ScanResult> _foundDevices = [];
+  var _foundDevices = <ScanResult>[];
 
   final _nameCtrl = TextEditingController();
   final _contactNameCtrl = TextEditingController();
@@ -76,7 +76,7 @@ class _FallMonitorPageState extends State<FallMonitorPage>
   final _bloodCtrl = TextEditingController();
   final _allergiesCtrl = TextEditingController();
 
-  List> _history = [];
+  var _history = >[];
 
   @override
   void initState() {
@@ -164,22 +164,30 @@ class _FallMonitorPageState extends State<FallMonitorPage>
     String phone = '';
     String blood = '';
     String allergies = '';
-    List> loadedHistory = [];
+    var loadedHistory = >[];
 
     try {
       final file = _getBackupFile();
       if (file != null && file.existsSync()) {
         final raw = file.readAsStringSync();
-        final data = jsonDecode(raw) as Map<String, dynamic>;
-        name = (data['fc_name'] ?? '').toString();
-        contactName = (data['fc_contact_name'] ?? '').toString();
-        phone = (data['fc_phone'] ?? '').toString();
-        blood = (data['fc_blood'] ?? '').toString();
-        allergies = (data['fc_allergies'] ?? '').toString();
-        if (data['fc_history'] is List) {
-          loadedHistory = (data['fc_history'] as List)
-              .map((e) => Map<String, String>.from(e as Map))
-              .toList();
+        final data = jsonDecode(raw);
+        if (data is Map) {
+          name = (data['fc_name'] ?? '').toString();
+          contactName = (data['fc_contact_name'] ?? '').toString();
+          phone = (data['fc_phone'] ?? '').toString();
+          blood = (data['fc_blood'] ?? '').toString();
+          allergies = (data['fc_allergies'] ?? '').toString();
+          final rawList = data['fc_history'];
+          if (rawList is Iterable) {
+            loadedHistory = rawList
+                .whereType()
+                .map((e) => <String, String>{
+                      'date': (e['date'] ?? '').toString(),
+                      'time': (e['time'] ?? '').toString(),
+                      'status': (e['status'] ?? '').toString(),
+                    })
+                .toList();
+          }
         }
       }
     } catch (_) {}
@@ -196,9 +204,17 @@ class _FallMonitorPageState extends State<FallMonitorPage>
       }
       final rawHist = prefs.getString('fc_history');
       if (rawHist != null && loadedHistory.isEmpty) {
-        final decoded = jsonDecode(rawHist) as List;
-        loadedHistory =
-            decoded.map((e) => Map<String, String>.from(e as Map)).toList();
+        final decoded = jsonDecode(rawHist);
+        if (decoded is Iterable) {
+          loadedHistory = decoded
+              .whereType()
+              .map((e) => <String, String>{
+                    'date': (e['date'] ?? '').toString(),
+                    'time': (e['time'] ?? '').toString(),
+                    'status': (e['status'] ?? '').toString(),
+                  })
+              .toList();
+        }
       }
     } catch (_) {}
 
