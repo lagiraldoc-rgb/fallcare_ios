@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -36,7 +37,8 @@ class FallMonitorPage extends StatefulWidget {
   State<FallMonitorPage> createState() => _FallMonitorPageState();
 }
 
-class _FallMonitorPageState extends State<FallMonitorPage> {
+class _FallMonitorPageState extends State<FallMonitorPage>
+    with WidgetsBindingObserver {
   static final Guid serviceUuid = Guid('00000000-0001-11e1-9ab4-0002a5d5c51b');
   static final Guid charUuid = Guid('00000001-0001-11e1-ac36-0002a5d5c51b');
 
@@ -48,10 +50,13 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   BluetoothCharacteristic? _fallChar;
   StreamSubscription<List<int>>? _charSub;
   StreamSubscription<BluetoothConnectionState>? _connSub;
+  StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<Position>? _gpsSub;
 
   Timer? _hapticTimer;
   Timer? _countdownTimer;
+  Timer? _autoResetTimer;
+  Timer? _saveDebounce;
 
   bool _isScanning = false;
   bool _isConnected = false;
@@ -63,6 +68,7 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   String _gpsText = 'GPS: Esperando ubicación...';
   String _mapsUrl = '';
   String _autoAlertStatus = '';
+  List<ScanResult> _foundDevices = [];
 
   final _nameCtrl = TextEditingController();
   final _contactNameCtrl = TextEditingController();
@@ -70,15 +76,39 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   final _bloodCtrl = TextEditingController();
   final _allergiesCtrl = TextEditingController();
 
-  List<dynamic> _history = [];
+  List> _history = [];
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initNotifications();
     _initAudio();
     _loadSavedData();
     _startGpsTracking();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _persistAllNow(showBanner: false);
+    }
+  }
+
+  File? _getBackupFile() {
+    try {
+      final home = Platform.environment['HOME'];
+      if (home == null || home.isEmpty) return null;
+      final docsDir = Directory('$home/Documents');
+      if (!docsDir.existsSync()) {
+        docsDir.createSync(recursive: true);
+      }
+      return File('${docsDir.path}/fallcare_profile.json');
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> _initAudio() async {
@@ -129,35 +159,107 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   }
 
   Future<void> _loadSavedData() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _nameCtrl.text = prefs.getString('fc_name') ?? '';
-      _contactNameCtrl.text = prefs.getString('fc_contact_name') ?? '';
-      _phoneCtrl.text = prefs.getString('fc_phone') ?? '';
-      _bloodCtrl.text = prefs.getString('fc_blood') ?? '';
-      _allergiesCtrl.text = prefs.getString('fc_allergies') ?? '';
-      final rawHist = prefs.getString('fc_history');
-      if (rawHist != null) {
-        final decoded = jsonDecode(rawHist) as List;
-        _history = decoded.map((e) => Map<String, String>.from(e)).toList();
+    String name = '';
+    String contactName = '';
+    String phone = '';
+    String blood = '';
+    String allergies = '';
+    List> loadedHistory = [];
+
+    try {
+      final file = _getBackupFile();
+      if (file != null && file.existsSync()) {
+        final raw = file.readAsStringSync();
+        final data = jsonDecode(raw) as Map<String, dynamic>;
+        name = (data['fc_name'] ?? '').toString();
+        contactName = (data['fc_contact_name'] ?? '').toString();
+        phone = (data['fc_phone'] ?? '').toString();
+        blood = (data['fc_blood'] ?? '').toString();
+        allergies = (data['fc_allergies'] ?? '').toString();
+        if (data['fc_history'] is List) {
+          loadedHistory = (data['fc_history'] as List)
+              .map((e) => Map<String, String>.from(e as Map))
+              .toList();
+        }
       }
+    } catch (_) {}
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if ((prefs.getString('fc_phone') ?? '').isNotEmpty ||
+          (prefs.getString('fc_name') ?? '').isNotEmpty) {
+        name = prefs.getString('fc_name') ?? name;
+        contactName = prefs.getString('fc_contact_name') ?? contactName;
+        phone = prefs.getString('fc_phone') ?? phone;
+        blood = prefs.getString('fc_blood') ?? blood;
+        allergies = prefs.getString('fc_allergies') ?? allergies;
+      }
+      final rawHist = prefs.getString('fc_history');
+      if (rawHist != null && loadedHistory.isEmpty) {
+        final decoded = jsonDecode(rawHist) as List;
+        loadedHistory =
+            decoded.map((e) => Map<String, String>.from(e as Map)).toList();
+      }
+    } catch (_) {}
+
+    if (!mounted) return;
+    setState(() {
+      _nameCtrl.text = name;
+      _contactNameCtrl.text = contactName;
+      _phoneCtrl.text = phone;
+      _bloodCtrl.text = blood;
+      _allergiesCtrl.text = allergies;
+      _history = loadedHistory;
     });
   }
 
-  Future<void> _saveSettings({bool showBanner = true}) async {
-    final prefs = await SharedPreferences.getInstance();
+  void _scheduleSave() {
+    _saveDebounce?.cancel();
+    _saveDebounce = Timer(const Duration(milliseconds: 300), () {
+      _persistAllNow(showBanner: false);
+    });
+  }
+
+  Future<void> _persistAllNow({bool showBanner = true}) async {
     final cleanPhone = _phoneCtrl.text.replaceAll(RegExp(r'\D'), '');
-    await prefs.setString('fc_name', _nameCtrl.text.trim());
-    await prefs.setString('fc_contact_name', _contactNameCtrl.text.trim());
-    await prefs.setString('fc_phone', cleanPhone);
-    await prefs.setString('fc_blood', _bloodCtrl.text.trim());
-    await prefs.setString('fc_allergies', _allergiesCtrl.text.trim());
+    final name = _nameCtrl.text.trim();
+    final contactName = _contactNameCtrl.text.trim();
+    final blood = _bloodCtrl.text.trim();
+    final allergies = _allergiesCtrl.text.trim();
+
+    try {
+      final file = _getBackupFile();
+      if (file != null) {
+        final payload = {
+          'fc_name': name,
+          'fc_contact_name': contactName,
+          'fc_phone': cleanPhone,
+          'fc_blood': blood,
+          'fc_allergies': allergies,
+          'fc_history': _history,
+        };
+        file.writeAsStringSync(jsonEncode(payload), flush: true);
+      }
+    } catch (_) {}
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('fc_name', name);
+      await prefs.setString('fc_contact_name', contactName);
+      await prefs.setString('fc_phone', cleanPhone);
+      await prefs.setString('fc_blood', blood);
+      await prefs.setString('fc_allergies', allergies);
+      await prefs.setString('fc_history', jsonEncode(_history));
+    } catch (_) {}
 
     if (showBanner && mounted) {
-      _phoneCtrl.text = cleanPhone;
+      FocusScope.of(context).unfocus();
+      setState(() {
+        _phoneCtrl.text = cleanPhone;
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Contacto y ficha médica guardados permanentemente.'),
+          content: Text('✅ Contacto y ficha médica guardados en el iPhone.'),
           duration: Duration(seconds: 2),
         ),
       );
@@ -167,7 +269,9 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
   Future<void> _startGpsTracking() async {
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
-      setState(() => _gpsText = 'GPS: Activa la ubicación en Ajustes.');
+      if (mounted) {
+        setState(() => _gpsText = 'GPS: Activa la ubicación en Ajustes.');
+      }
       return;
     }
 
@@ -177,7 +281,9 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
     }
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
-      setState(() => _gpsText = 'GPS: Permiso denegado.');
+      if (mounted) {
+        setState(() => _gpsText = 'GPS: Permiso denegado.');
+      }
       return;
     }
 
@@ -209,36 +315,99 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
     });
   }
 
+  bool _isTargetSensor(ScanResult r) {
+    final advName = r.advertisementData.advName.toLowerCase();
+    final platName = r.device.platformName.toLowerCase();
+    final hasService = r.advertisementData.serviceUuids.any(
+        (u) => u.toString().toLowerCase() == serviceUuid.toString().toLowerCase());
+
+    return hasService ||
+        advName.contains('am1v') ||
+        platName.contains('am1v') ||
+        advName.contains('sensortile') ||
+        platName.contains('sensortile') ||
+        advName.contains('allmems') ||
+        platName.contains('allmems') ||
+        advName.contains('bluenrg') ||
+        platName.contains('bluenrg');
+  }
+
   Future<void> _scanAndConnect() async {
     if (_isScanning) return;
-    await _saveSettings(showBanner: false);
+    await _persistAllNow(showBanner: false);
+
     setState(() {
       _isScanning = true;
-      _statusText = 'Buscando SensorTile (AM1V420)...';
+      _foundDevices = [];
+      _statusText = 'Iniciando Bluetooth del iPhone...';
     });
 
     try {
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
-      late StreamSubscription<List<ScanResult>> scanSub;
-      scanSub = FlutterBluePlus.scanResults.listen((results) async {
+      final adapterState = await FlutterBluePlus.adapterState
+          .where((s) =>
+              s == BluetoothAdapterState.on ||
+              s == BluetoothAdapterState.off ||
+              s == BluetoothAdapterState.unauthorized)
+          .first
+          .timeout(const Duration(seconds: 5),
+              onTimeout: () => BluetoothAdapterState.on);
+
+      if (adapterState == BluetoothAdapterState.unauthorized) {
+        if (mounted) {
+          setState(() {
+            _isScanning = false;
+            _statusText =
+                'Permiso Bluetooth denegado. Actívalo en Ajustes > FallCare.';
+          });
+        }
+        return;
+      }
+
+      if (adapterState == BluetoothAdapterState.off) {
+        if (mounted) {
+          setState(() {
+            _isScanning = false;
+            _statusText = 'Enciende el Bluetooth en tu iPhone.';
+          });
+        }
+        return;
+      }
+
+      if (mounted) {
+        setState(() => _statusText = 'Buscando SensorTile (AM1V420)...');
+      }
+
+      await _scanSub?.cancel();
+      _scanSub = FlutterBluePlus.scanResults.listen((results) async {
+        if (mounted) {
+          setState(() {
+            _foundDevices = results
+                .where((r) =>
+                    r.advertisementData.advName.isNotEmpty ||
+                    r.device.platformName.isNotEmpty)
+                .toList();
+          });
+        }
+
         for (final r in results) {
-          final name = r.device.platformName;
-          final hasService = r.advertisementData.serviceUuids.any((u) =>
-              u.toString().toLowerCase() == serviceUuid.toString().toLowerCase());
-          if (name.contains('AM1V') || hasService) {
+          if (_isTargetSensor(r)) {
             await FlutterBluePlus.stopScan();
-            await scanSub.cancel();
+            await _scanSub?.cancel();
             await _connectToDevice(r.device);
             return;
           }
         }
       });
 
-      await Future.delayed(const Duration(seconds: 10));
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 12));
+
+      await Future.delayed(const Duration(seconds: 12));
       if (!_isConnected && mounted) {
         setState(() {
           _isScanning = false;
-          _statusText = 'No se encontró AM1V420. Verifica que esté encendido.';
+          _statusText = _foundDevices.isEmpty
+              ? 'No se detectó la SensorTile. Verifica batería/encendido.'
+              : 'Selecciona tu dispositivo en la lista de abajo:';
         });
       }
     } catch (e) {
@@ -253,7 +422,17 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
 
   Future<void> _connectToDevice(BluetoothDevice device) async {
     try {
-      setState(() => _statusText = 'Conectando a ${device.platformName}...');
+      await FlutterBluePlus.stopScan();
+      final label = device.platformName.isNotEmpty
+          ? device.platformName
+          : device.remoteId.str;
+      if (mounted) {
+        setState(() {
+          _isScanning = false;
+          _statusText = 'Conectando a $label...';
+        });
+      }
+
       await device.connect(autoConnect: false);
       _connectedDevice = device;
 
@@ -262,6 +441,7 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
         if (state == BluetoothConnectionState.disconnected && mounted) {
           _stopAlarm();
           _countdownTimer?.cancel();
+          _autoResetTimer?.cancel();
           setState(() {
             _isConnected = false;
             _isScanning = false;
@@ -273,18 +453,22 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
       });
 
       final services = await device.discoverServices();
+      bool subscribed = false;
       for (final s in services) {
         if (s.uuid == serviceUuid) {
           for (final c in s.characteristics) {
             if (c.uuid == charUuid) {
               _fallChar = c;
               await c.setNotifyValue(true);
+              subscribed = true;
               _charSub?.cancel();
               _charSub = c.onValueReceived.listen((value) {
                 if (value.isEmpty) return;
                 final byteVal = value[0];
-                setState(() =>
-                    _lastByteText = 'Sensor: 0x0${byteVal.toRadixString(16)}');
+                if (mounted) {
+                  setState(() => _lastByteText =
+                      'Sensor: 0x0${byteVal.toRadixString(16)}');
+                }
                 if (byteVal == 1) {
                   _triggerFallAlert();
                 }
@@ -294,24 +478,31 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
         }
       }
 
-      setState(() {
-        _isConnected = true;
-        _isScanning = false;
-        _lastByteText = 'Sensor: 0x00 (Listo)';
-        _statusText =
-            'Monitoreando en primer y segundo plano (${device.platformName})';
-      });
+      if (mounted) {
+        setState(() {
+          _isConnected = true;
+          _isScanning = false;
+          _foundDevices = [];
+          _lastByteText = subscribed
+              ? 'Sensor: 0x00 (Listo)'
+              : 'Sensor: Conectado (sin servicio caídas)';
+          _statusText = 'Monitoreando en primer y segundo plano ($label)';
+        });
+      }
     } catch (e) {
-      setState(() {
-        _isScanning = false;
-        _isConnected = false;
-        _statusText = 'Error al conectar: $e';
-      });
+      if (mounted) {
+        setState(() {
+          _isScanning = false;
+          _isConnected = false;
+          _statusText = 'Error al conectar: $e';
+        });
+      }
     }
   }
 
   void _triggerFallAlert() {
     if (_isFallActive) return;
+    _autoResetTimer?.cancel();
     final now = DateTime.now();
     final timeStr =
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
@@ -322,23 +513,30 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
       _fallTime = now;
       _countdown = 15;
       _autoAlertStatus =
-          'La alerta automática con ubicación se enviará al finalizar el conteo.';
+          'La alerta automática con ubicación se enviará al llegar a 0s.';
     });
 
     _addHistory(dateStr, timeStr, 'Alerta activa (sin confirmar)');
     _showBackgroundFallNotification(timeStr);
     _startAlarmSound();
 
+    bool alreadyDispatched = false;
     _countdownTimer?.cancel();
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+    _countdownTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
       if (!mounted) return;
-      if (_countdown <= 1) {
+      final elapsed = DateTime.now().difference(now).inSeconds;
+      final remaining = 15 - elapsed;
+
+      if (remaining <= 0) {
         timer.cancel();
         setState(() => _countdown = 0);
-        _updateLatestHistory('Alerta confirmada (enviada automáticamente)');
-        _sendAutomaticAlert(timeStr);
+        if (!alreadyDispatched) {
+          alreadyDispatched = true;
+          _updateLatestHistory('Alerta confirmada (enviada automáticamente)');
+          _sendAutomaticAlert(timeStr);
+        }
       } else {
-        setState(() => _countdown--);
+        setState(() => _countdown = remaining);
       }
     });
   }
@@ -357,9 +555,10 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
       if (mounted) {
         setState(() {
           _autoAlertStatus =
-              '⚠️ Configura un número de teléfono válido (10 dígitos).';
+              '⚠️ Escribe un número de teléfono válido (10 dígitos) en el formulario.';
         });
       }
+      _scheduleAutoReset();
       return;
     }
 
@@ -397,40 +596,92 @@ class _FallMonitorPageState extends State<FallMonitorPage> {
 $locationLine
 ''';
 
-    final uri = Uri.parse('https://ntfy.sh/fallcare-$last10');
-    final headers = <String, String>{
-      'Title': 'ALERTA DE CAIDA - $patient',
-      'Priority': 'urgent',
-      'Tags': 'rotating_light,warning',
+    final topicName = 'fallcare-$last10';
+    final jsonPayload = <String, dynamic>{
+      'topic': topicName,
+      'title': 'ALERTA DE CAIDA - $patient',
+      'message': body,
+      'priority': 5,
+      'tags': ['rotating_light', 'warning'],
+      if (_mapsUrl.isNotEmpty)
+        'actions': [
+          {
+            'action': 'view',
+            'label': 'Ver ubicacion en mapa',
+            'url': _mapsUrl,
+          }
+        ],
     };
-    if (_mapsUrl.isNotEmpty) {
-      headers['Actions'] = 'view, Ver ubicacion en mapa, $_mapsUrl';
-    }
 
     try {
-      final response = await http.post(uri, headers: headers, body: body);
+      final response = await http
+          .post(
+            Uri.parse('https://ntfy.sh'),
+            headers: {'Content-Type': 'application/json; charset=utf-8'},
+            body: utf8.encode(jsonEncode(jsonPayload)),
+          )
+          .timeout(const Duration(seconds: 10));
+
       if (!mounted) return;
       if (response.statusCode >= 200 && response.statusCode < 300) {
         final contactLabel = _contactNameCtrl.text.trim().isEmpty
-            ? _phoneCtrl.text.trim()
-            : '${_contactNameCtrl.text.trim()} (${_phoneCtrl.text.trim()})';
+            ? last10
+            : '${_contactNameCtrl.text.trim()} ($last10)';
         setState(() {
           _autoAlertStatus =
-              '✅ Alerta y ubicación enviadas automáticamente a $contactLabel.';
+              '✅ Alerta enviada a $contactLabel. Volviendo a estado normal...';
         });
       } else {
         setState(() {
           _autoAlertStatus =
-              '⚠️ Error del servidor al enviar (${response.statusCode}).';
+              '⚠️ Error del servidor (${response.statusCode}): ${response.body}';
         });
       }
     } catch (e) {
       if (mounted) {
         setState(() {
-          _autoAlertStatus = '⚠️ Sin conexión a internet para enviar la alerta.';
+          _autoAlertStatus = '⚠️ No se pudo enviar la alerta: $e';
         });
       }
     }
+
+    _scheduleAutoReset();
+  }
+
+  void _scheduleAutoReset() {
+    _autoResetTimer?.cancel();
+    _autoResetTimer = Timer(const Duration(seconds: 4), () {
+      if (!mounted || !_isFallActive) return;
+      _resetToNormalAfterAlert();
+    });
+  }
+
+  Future<void> _resetToNormalAfterAlert() async {
+    _stopAlarm();
+    _countdownTimer?.cancel();
+    _autoResetTimer?.cancel();
+
+    if (_fallChar != null) {
+      try {
+        await _fallChar!.write(
+          [0x00],
+          withoutResponse: _fallChar!.properties.writeWithoutResponse,
+        );
+      } catch (_) {}
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _isFallActive = false;
+      _autoAlertStatus = '';
+      if (_isConnected) {
+        _lastByteText = 'Sensor: 0x00 (Listo)';
+        _statusText = 'Alerta enviada. Monitoreando en primer y segundo plano';
+      } else {
+        _statusText =
+            'Alerta enviada. Presiona "Conectar SensorTile" para iniciar.';
+      }
+    });
   }
 
   Future<void> _startAlarmSound() async {
@@ -461,6 +712,7 @@ $locationLine
   Future<void> _acknowledgeFall() async {
     _stopAlarm();
     _countdownTimer?.cancel();
+    _autoResetTimer?.cancel();
     final elapsed =
         _fallTime != null ? DateTime.now().difference(_fallTime!).inSeconds : 0;
     await _updateLatestHistory('Confirmada bien en ${elapsed}s');
@@ -491,26 +743,29 @@ $locationLine
   }
 
   Future<void> _addHistory(String date, String time, String status) async {
-    final prefs = await SharedPreferences.getInstance();
     setState(() {
       _history.insert(0, {'date': date, 'time': time, 'status': status});
       if (_history.length > 20) _history.removeLast();
     });
-    await prefs.setString('fc_history', jsonEncode(_history));
+    await _persistAllNow(showBanner: false);
   }
 
   Future<void> _updateLatestHistory(String status) async {
     if (_history.isEmpty) return;
-    final prefs = await SharedPreferences.getInstance();
     setState(() => _history[0]['status'] = status);
-    await prefs.setString('fc_history', jsonEncode(_history));
+    await _persistAllNow(showBanner: false);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _saveDebounce?.cancel();
+    _persistAllNow(showBanner: false);
     _stopAlarm();
     _audioPlayer.dispose();
     _countdownTimer?.cancel();
+    _autoResetTimer?.cancel();
+    _scanSub?.cancel();
     _charSub?.cancel();
     _connSub?.cancel();
     _gpsSub?.cancel();
@@ -682,6 +937,37 @@ $locationLine
                     ),
                   ),
                 ),
+                if (!_isConnected && _foundDevices.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.black26,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'Dispositivos cercanos (toca para conectar):',
+                          style: TextStyle(
+                              fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 6),
+                        ..._foundDevices.map((r) {
+                          final name = r.advertisementData.advName.isNotEmpty
+                              ? r.advertisementData.advName
+                              : r.device.platformName;
+                          return TextButton(
+                            onPressed: () => _connectToDevice(r.device),
+                            child: Text('📡 $name (${r.rssi} dBm)'),
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 8),
                 TextButton(
                   onPressed: _triggerFallAlert,
@@ -704,38 +990,39 @@ $locationLine
                     const SizedBox(height: 8),
                     TextField(
                       controller: _contactNameCtrl,
-                      onChanged: (_) => _saveSettings(showBanner: false),
+                      onChanged: (_) => _scheduleSave(),
                       decoration: const InputDecoration(
                           labelText: 'Nombre del contacto de emergencia'),
                     ),
                     TextField(
                       controller: _phoneCtrl,
                       keyboardType: TextInputType.phone,
-                      onChanged: (_) => _saveSettings(showBanner: false),
+                      onChanged: (_) => _scheduleSave(),
                       decoration: const InputDecoration(
-                          labelText: 'Teléfono de emergencia (ej. 313 580 7499)'),
+                          labelText:
+                              'Teléfono de emergencia (ej. 313 580 7499)'),
                     ),
                     const SizedBox(height: 12),
                     TextField(
                       controller: _nameCtrl,
-                      onChanged: (_) => _saveSettings(showBanner: false),
+                      onChanged: (_) => _scheduleSave(),
                       decoration: const InputDecoration(
                           labelText: 'Nombre completo del paciente'),
                     ),
                     TextField(
                       controller: _bloodCtrl,
-                      onChanged: (_) => _saveSettings(showBanner: false),
+                      onChanged: (_) => _scheduleSave(),
                       decoration:
                           const InputDecoration(labelText: 'RH y EPS'),
                     ),
                     TextField(
                       controller: _allergiesCtrl,
-                      onChanged: (_) => _saveSettings(showBanner: false),
+                      onChanged: (_) => _scheduleSave(),
                       decoration: const InputDecoration(labelText: 'Alergias'),
                     ),
                     const SizedBox(height: 12),
                     ElevatedButton(
-                      onPressed: () => _saveSettings(showBanner: true),
+                      onPressed: () => _persistAllNow(showBanner: true),
                       child: const Text('Guardar configuración'),
                     ),
                   ],
