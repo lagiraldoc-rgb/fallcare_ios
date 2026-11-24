@@ -18,12 +18,24 @@ workflows:
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" ios/Runner/Info.plist
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string bluetooth-central" ios/Runner/Info.plist
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:1 string location" ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:2 string audio" ios/Runner/Info.plist
           /usr/libexec/PlistBuddy -c "Delete :NSBluetoothAlwaysUsageDescription" ios/Runner/Info.plist 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :NSBluetoothAlwaysUsageDescription string 'FallCare necesita Bluetooth en segundo plano para detectar caidas.'" ios/Runner/Info.plist
           /usr/libexec/PlistBuddy -c "Delete :NSLocationWhenInUseUsageDescription" ios/Runner/Info.plist 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :NSLocationWhenInUseUsageDescription string 'FallCare usa tu ubicacion para enviar alertas de emergencia.'" ios/Runner/Info.plist
           /usr/libexec/PlistBuddy -c "Delete :NSLocationAlwaysAndWhenInUseUsageDescription" ios/Runner/Info.plist 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :NSLocationAlwaysAndWhenInUseUsageDescription string 'FallCare necesita tu ubicacion incluso con el telefono bloqueado.'" ios/Runner/Info.plist
+          if [ -f "assets/alarma_caida.wav" ]; then
+            cp assets/alarma_caida.wav ios/Runner/alarma_caida.wav
+            ruby -e '
+              require "xcodeproj"
+              project = Xcodeproj::Project.open("ios/Runner.xcodeproj")
+              target = project.targets.first
+              file_ref = project.main_group["Runner"].new_file("alarma_caida.wav")
+              target.resources_build_phase.add_file_reference(file_ref)
+              project.save
+            '
+          fi
       - name: Build unsigned iOS IPA
         script: |
           set -e
